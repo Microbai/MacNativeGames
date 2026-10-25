@@ -295,11 +295,37 @@ static uint64_t gpu_budget_bytes(void) {
     }
     return b;
 }
+static void defer_drain(void);
 static void gpu_budget_check(const char *where) {
     uint64_t budget = gpu_budget_bytes(); if (!budget) return;
     uint64_t cur = (uint64_t)g_dev.currentAllocatedSize; if (cur <= budget) return;
+    /* Over the line, part of it can be objects already retired and the staging of submissions still on the GPU, both freed
+       when those submissions complete (#616: stopped 51 s after the start while the world loaded; #614: on a dive). Let the
+       running work complete and release what it held (at most 2 s; it stops early once nothing more completes), then look
+       again: only memory still allocated after that stops the game. The submission being built is not committed yet, so its
+       own fence is never waited for. */
+    const uint64_t first = cur, t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE), quiet = t0;
+    for (;;) {
+        defer_drain();
+        cur = (uint64_t)g_dev.currentAllocatedSize; if (cur <= budget) break;
+        uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), d = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);
+        if (d != done || atomic_load(&g_q4_inflight)) { done = d; quiet = t; }
+        else if (t - quiet > 20000000ull) break;   // nothing is running or completing any more
+        if (t - t0 > 2000000000ull) break;
+        usleep(500);
+    }
+    double waited_ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6;
+    if (cur <= budget) {
+        static unsigned spikes; spikes++;
+        if (spikes <= 8 || spikes % 100 == 0)
+            MLOG("显存短时超过预算（第 %u 次，%s）：%llu MB，等在途提交完成、放掉退役对象后 %llu MB，等了 %.1f ms（预算 %llu MB）",
+                 spikes, where, (unsigned long long)(first >> 20), (unsigned long long)(cur >> 20), waited_ms, (unsigned long long)(budget >> 20));
+        return;
+    }
     res_site_report(16);
-    MDIE("%s：显卡已分配 %llu MB 超过预算 %llu MB；四次内核崩溃都发生在驻留内存约 15 GB 时，拒绝继续提交（TOTK_GPU_BUDGET_MB 调整）", where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20));
+    MDIE("%s：显卡已分配 %llu MB 超过预算 %llu MB（等在途提交完成、放掉退役对象 %.1f ms 前是 %llu MB）；四次内核崩溃都发生在驻留内存约 15 GB 时，拒绝继续提交（TOTK_GPU_BUDGET_MB 调整）",
+         where, (unsigned long long)(cur >> 20), (unsigned long long)(budget >> 20), waited_ms, (unsigned long long)(first >> 20));
 }
 // DM_RES_CHECK=1（诊断）：着色器经参数块访问的贴图 / 缓冲若不在驻留集里，打出前 40 个（贴图按父贴图 / 底层缓冲归到实际分配）
 // DM_RES_CHECK=1 (diagnostic): if textures / buffers the shader accesses through the argument block are not in the residency set, print the first 40 (textures are attributed to the actual allocation via parent texture / underlying buffer)
@@ -705,6 +731,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
 }
 
 static void stor_drop_range(uintptr_t lo, uintptr_t hi);
+static void wb_drop_range(uintptr_t lo, uintptr_t hi);
 static void stor_sweep(uint64_t fence);
 void mtl_pool_del(const void *mem) {
     g_reg_gen++;
@@ -719,7 +746,7 @@ void mtl_pool_del(const void *mem) {
         [g_keep removeObjectIdenticalTo:buf];
     }
     pthread_mutex_unlock(&g_mu);
-    if (hi > lo) stor_drop_range(lo, hi);   // TOTK: storage-shared textures of this pool
+    if (hi > lo) { stor_drop_range(lo, hi); wb_drop_range(lo, hi); }   // TOTK: storage-shared textures and pending write-backs of this pool
 }
 
 static pidx_ent *pool_query(uintptr_t addr, uint64_t len) { // caller holds g_mu
@@ -2375,6 +2402,10 @@ static void pkg_owned_locked(uint64_t k) {
 typedef struct { tex_t t; uint64_t stamp; void *obj; uint8_t *snap; uint32_t snap_n; BOTW_WB_ENT_FIELDS } wb_ent;   // snap: the texture's own bytes when the rendering was noted (small targets only)
 static nvn_hmap g_wb = {.klen = 8};   // serial -> wb_ent * (g_smu): rendered since the last write-back
 static _Atomic int g_wb_on = 1;
+static _Atomic int g_wb_fence_small = -1;   // -1: from TOTK_WB_FENCE_SMALL; "flag wb_fence_small 0|1" switches it while the game runs
+static int wb_fence_small_on(void);
+static void wb_drop_all(void);
+static void wb_write_list(wb_ent **list, int nl, int force);
 /* TOTK: fill the driver segment c0 for vertex and compute shaders (thread-group counts, uniform / storage address tables,
    point size limit; see drv_scan). TOTK_DRV_FILL=0 or "flag drvfill 0" gives them the old all-zero segment (A/B only). */
 static _Atomic int g_drvfill_on = -1;
@@ -2463,7 +2494,8 @@ void dm_gfx_set_flag(const char *name, int v) {
     }
     if (!strcmp(name, "drv_cache")) { driver_cache_set(v); return; }
     if (!strcmp(name, "drv_cache_check")) { driver_cache_check_set(v); return; }
-    if (!strcmp(name, "writeback")) { atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
+    if (!strcmp(name, "writeback")) { if (!v) wb_drop_all(); atomic_store(&g_wb_on, v); MLOG("[flag] writeback = %d", v); return; }
+    if (!strcmp(name, "wb_fence_small")) { (void)wb_fence_small_on(); atomic_store(&g_wb_fence_small, v != 0); MLOG("[flag] wb_fence_small = %d", v != 0); return; }
     if (!strcmp(name, "deferred")) { extern void nvn_set_deferred_binds(int on); nvn_set_deferred_binds(v); return; }
     if (!strcmp(name, "framewait")) { extern void nvn_set_framewait(int on); nvn_set_framewait(v); return; }
     if (!strcmp(name, "uncapped_interval")) { extern void nvn_set_uncapped_interval(int on); nvn_set_uncapped_interval(v); return; }
@@ -2493,6 +2525,7 @@ static void wb_ent_free(wb_ent *e) { if (!e) return; if (e->obj) { defer_obj_rel
 enum { WB_SNAP_MAX = 256 * 1024 };
 static int wb_exact_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WB_EXACT"); v = !(e && !strcmp(e, "0")); } return v; }
 static uint64_t g_wb_exact_rescued;
+int totk_wb_fence_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_WB_FENCE"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("TOTK_WB_FENCE=0: write-backs wait for all submitted GPU work"); } return v; }
 static void wb_snap(wb_ent *e) {
     if (!wb_exact_on() || !e->t.mem || e->t.L.size > WB_SNAP_MAX) { free(e->snap); e->snap = NULL; e->snap_n = 0; return; }
     uint32_t n = (uint32_t)e->t.L.size; if (e->snap_n != n) { free(e->snap); e->snap = malloc(n); e->snap_n = e->snap ? n : 0; }
@@ -2515,7 +2548,23 @@ static void wb_note(const tex_t *t) {
     nvn_hm_put(&g_wb, &k, e);
     pthread_mutex_unlock(&g_smu);
 }
-static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {
+/* A write-back lands in guest memory only while the whole texture lies in a live memory pool, and with g_mu held, which
+   mtl_pool_del (nvnMemoryPoolFinalize) takes too: the pool cannot be finalized and its bytes handed back to the game's heap
+   in the middle of the write. Freshness is decided before the GPU read-back, which waits for the GPU; another thread could
+   finalize the pool meanwhile (#764: after a warp, a sead heap block header and an NVN pool allocator node held pixel
+   bytes). Returns 1 with g_mu held; 0 (counted, logged) when the bytes are no longer a live pool's. */
+enum { WB_POOL_GONE = -2 };   // botw_wb_from_stage's -1 is "not staged"
+static uint64_t g_wb_pool_gone;
+static int wb_target_lock(const tex_t *t) {
+    pthread_mutex_lock(&g_mu);
+    if (pidx_find(&g_pools, (uintptr_t)t->mem, t->L.size)) return 1;
+    pthread_mutex_unlock(&g_mu);
+    if (++g_wb_pool_gone <= 8 || g_wb_pool_gone % 500 == 0)
+        MLOG("[writeback] skipped (its memory pool was finalized during the read-back, or the texture runs past its pool) ser=%llu %ux%u at %p size %#llx (%llu so far)",
+             (unsigned long long)t->serial, t->d.width, t->d.height, (void *)t->mem, (unsigned long long)t->L.size, (unsigned long long)g_wb_pool_gone);
+    return 0;
+}
+static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsigned layer) {   // 1 written, 0 failed, WB_POOL_GONE
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     uint32_t lw = MAX(t->d.width >> level, 1u), lh = MAX(t->d.height >> level, 1u);
     size_t lp = (size_t)((lw + bw - 1) / bw) * bpb, lr = (lh + bh - 1) / bh;
@@ -2530,7 +2579,10 @@ static int wb_level_back(const tex_t *t, id<MTLTexture> mt, unsigned level, unsi
     [b copyFromTexture:mt sourceSlice:layer sourceLevel:level sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(lw, lh, 1)
               toBuffer:buf destinationOffset:0 destinationBytesPerRow:lp destinationBytesPerImage:lp * lr];
     enc_b_end(b); cb_commit(cb); cb_wait(cb);
-    if (nvn_swizzle(&t->d, level, layer, (const uint8_t *)buf.contents, lp, t->mem)) return 0;
+    if (!wb_target_lock(t)) return WB_POOL_GONE;
+    int bad = nvn_swizzle(&t->d, level, layer, (const uint8_t *)buf.contents, lp, t->mem);
+    pthread_mutex_unlock(&g_mu);
+    if (bad) return 0;
     g_wb_bytes += lp * lr;
     }
     return 1;
@@ -2565,9 +2617,68 @@ void mtl_pool_invalidate(const pool_t *p, uint64_t off, uint64_t n) {
     pthread_mutex_unlock(&g_smu);
     wb_write_list(list, nl, 0);
 }
+/* A memory pool is finalized: pending renderings into its bytes are dropped. The game has given the range back to its
+   allocator, which hands it to something else (a sead heap object, another pool); a later invalidate over that address
+   would write GPU pixels into the new owner (2026-10-24: warping to a shrine with write-back on crashed in the sead heap
+   block factory with a pixel pattern 0x7a7a7a7b7b7a7774 where a free-list pointer belongs). On hardware the rendering
+   already reached memory; here there is nobody left to write it for. */
+static void wb_drop_range(uintptr_t lo, uintptr_t hi) {
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_wb.cap; i++) {
+        wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
+        if (!e || (uintptr_t)e->t.mem >= hi || (uintptr_t)e->t.mem + e->t.L.size <= lo) continue;
+        uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); wb_ent_free(e); i = (uint32_t)-1;   // deletion shifts entries: rescan
+    }
+    pthread_mutex_unlock(&g_smu);
+}
+/* Write-back turned off: renderings noted so far are forgotten (turned on again, an old one must not land in memory the
+   game has rewritten in the meantime). */
+static void wb_drop_all(void) {
+    pthread_mutex_lock(&g_smu);
+    for (uint32_t i = 0; i < g_wb.cap; i++) {
+        wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
+        if (!e) continue;
+        uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); wb_ent_free(e); i = (uint32_t)-1;
+    }
+    pthread_mutex_unlock(&g_smu);
+}
+/* TOTK: the cut reaction of grass is decided from a 128x128 RGBA8 target that the grass pass renders every frame into a
+   pool the CPU reads without an invalidate, flush or copy. On hardware the bytes are in the pool once the frame's fence
+   has passed; here they stayed in the Metal texture, and every swing was decided from the zeros the pool held (no blades,
+   no insects, grass not cut -- upstream issue #49). Render targets up to 64 KiB whose rendering has completed are written
+   back after the game's fence waits (nvnSyncWait / nvnQueueFinish); wb_write_list still keeps newer CPU writes.
+   TOTK_WB_FENCE_SMALL=0 restores the invalidate-only behaviour. Breath of the Wild: off unless TOTK_WB_FENCE_SMALL=1. */
+enum { WB_FENCE_SMALL_MAX = 64 * 1024 };
+static int wb_fence_small_on(void) {
+    int v = atomic_load(&g_wb_fence_small);
+#ifdef GAME_BOTW   /* not measured on Breath of the Wild, whose small targets go through the staged write-back: opt-in there (after PR #562) */
+    if (v < 0) { const char *e = getenv("TOTK_WB_FENCE_SMALL"); v = e && !strcmp(e, "1"); atomic_store(&g_wb_fence_small, v); }
+#else
+    if (v < 0) { const char *e = getenv("TOTK_WB_FENCE_SMALL"); v = !(e && !strcmp(e, "0")); atomic_store(&g_wb_fence_small, v); }
+#endif
+    return v;
+}
+void mtl_wb_fence_done(void) {
+    if (!atomic_load(&g_wb_on) || !wb_fence_small_on()) return;
+    uint64_t done = __atomic_load_n(&g_done, __ATOMIC_ACQUIRE);   // every fence at or below this has completed
+    pthread_mutex_lock(&g_smu);
+    wb_ent *list[512]; int nl = 0;
+    for (uint32_t i = 0; i < g_wb.cap && nl < 512; i++) {
+        wb_ent *e = g_wb.vals ? g_wb.vals[i] : NULL;
+        if (!e || e->t.L.size > WB_FENCE_SMALL_MAX || e->fence > done) continue;
+        uint64_t k = e->t.serial; nvn_hm_del(&g_wb, &k); list[nl++] = e; i = (uint32_t)-1;   // deletion shifts entries: rescan
+    }
+    pthread_mutex_unlock(&g_smu);
+    wb_write_list(list, nl, 0);
+}
 /* Writes the listed renderings back to memory (the entries are freed); force: even over CPU writes since the render. */
-static void wb_write_list(wb_ent **list, int nl, int force) {
-    if (!nl) return;
+static void wb_write_list_body(wb_ent **list, int nl, int force);
+/* TOTK (2026-10-20, BotW): its own autorelease pool. nvnMemoryPoolInvalidateMappedRange calls this on a game thread,
+   outside the submission's pool, and game threads never drain their implicit one: every write-back's command buffer
+   and staging buffer stayed alive (about 1,700 IOAccelerator regions a minute in the world) until the GPU budget
+   stopped the game after 20-40 minutes. */
+static void wb_write_list(wb_ent **list, int nl, int force) { if (nl) @autoreleasepool { wb_write_list_body(list, nl, force); } }
+static void wb_write_list_body(wb_ent **list, int nl, int force) {
     { extern void nvn_x_drain(void) __attribute__((weak)); if (nvn_x_drain) nvn_x_drain(); }   // translation thread: nothing queued overtakes this read-back (as for ReadTexels)
     WB_WAIT_GPU(list, nl)
     /* Freshness is decided for every entry before anything is written back (a write-back marks its pages written), and
@@ -2613,9 +2724,10 @@ static void wb_write_list(wb_ent **list, int nl, int force) {
            with a neighbour counted as written, and the neighbour's own write-back was skipped as "CPU wrote since") */
         void *tok = nvn_dirty_tracked(t->mem, t->L.size) ? nvn_dirty_gpu_write_begin(t->mem, t->L.size) : NULL;
         if (!tok) dm_guest_write_prepare(t->mem, t->L.size);
-        unsigned layers = t->L.layers ? t->L.layers : 1, ok = 1; BOTW_WB_FROM_STAGE(e, ok, layers)
-        for (unsigned l = 0; l < t->d.levels && ok; l++) for (unsigned y = 0; y < layers && ok; y++) ok = wb_level_back(t, mt, l, y);
+        unsigned layers = t->L.layers ? t->L.layers : 1; int ok = 1; BOTW_WB_FROM_STAGE(e, ok, layers)
+        for (unsigned l = 0; l < t->d.levels && ok == 1; l++) for (unsigned y = 0; y < layers && ok == 1; y++) ok = wb_level_back(t, mt, l, y);
         nvn_dirty_gpu_write_end(tok);
+        if (ok == WB_POOL_GONE) { wb_ent_free(e); continue; }   // counted and logged by wb_target_lock
         if (ok) { uint64_t d = ++g_wb_done; if (d <= 8 || d % 500 == 0) MLOG("[writeback] ser=%llu %ux%u nvnfmt=%#x lv%u：GPU 渲染结果写回内存（累计 %llu 张 / %llu MB，CPU 已改写而跳过 %llu 张）", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, t->d.levels, (unsigned long long)d, (unsigned long long)(g_wb_bytes >> 20), (unsigned long long)g_wb_skip_cpu); }
         else MLOG("【红】GPU 写回内存失败 ser=%llu 格式 %#x", (unsigned long long)t->serial, t->d.format);
         wb_ent_free(e);
@@ -5073,8 +5185,27 @@ static MTLCompileOptions *totk_precise_opts(void) {
    memory pressure in the middle of a compile (iPad, 2026-10-18: "Compilation failed due to an interrupted connection:
    XPC_ERROR_CONNECTION_INTERRUPTED" while the shader warm-up was running); it restarts on the next request, so such a
    failure is retried instead of being taken as a broken shader. */
-static id<MTLLibrary> totk_msl_library(NSString *src, NSError **err) {
+/* SPIRV-Cross lowers textureGatherOffsets (four gathers at constant offsets) to spvGatherConstOffsets, which always passes a
+   component; Metal's depth2d::gather takes none, so a shader that does it on a depth texture did not compile and its draws
+   were never made (4 TotK shaders, 2026-10-20). Overloads for depth2d, with the generic helper's result (.w of each).
+   The source is patched only for Metal: libraries keep the name of the unpatched source (shader_lib_prebuilt). */
+static NSString *msl_fix_depth_gather(NSString *src) {
+    if (![src containsString:@"spvGatherConstOffsets"] || ![src containsString:@"depth2d<"]) return src;
+    static NSString *fix =
+        @"\n// TOTK: depth textures gather without a component\n"
+        "#define TOTK_DEPTH_GATHER(SPACE) \\\n"
+        "template<typename Toff, typename... Tp> inline float4 spvGatherConstOffsets(const SPACE depth2d<float>& t, sampler s, Toff coffsets, component, Tp... params) \\\n"
+        "{ return float4(t.gather(s, params..., coffsets[0]).w, t.gather(s, params..., coffsets[1]).w, t.gather(s, params..., coffsets[2]).w, t.gather(s, params..., coffsets[3]).w); }\n"
+        "TOTK_DEPTH_GATHER(device)\nTOTK_DEPTH_GATHER(constant)\nTOTK_DEPTH_GATHER(thread)\n#undef TOTK_DEPTH_GATHER\n\n";
+    for (NSString *entry in @[@"\nfragment ", @"\nvertex ", @"\nkernel "]) {
+        NSRange r = [src rangeOfString:entry];
+        if (r.location != NSNotFound) return [src stringByReplacingCharactersInRange:NSMakeRange(r.location, 0) withString:fix];
+    }
+    return src;
+}
+static id<MTLLibrary> totk_msl_library(NSString *source, NSError **err) {
     NSError *e = nil;
+    NSString *src = msl_fix_depth_gather(source);
     for (int attempt = 1;; attempt++) {
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:totk_precise_opts() error:&e];
         BOOL interrupted = !lib && [e.localizedDescription containsString:@"XPC_ERROR_CONNECTION_INTERRUPTED"];
@@ -8133,7 +8264,7 @@ static uint64_t dummy_buf_gpu(void) { static uint64_t gpu; if (!gpu) gpu = dummy
 // useResource 在同一编码器内对同一（资源, 用法, 阶段）是幂等的：记下本渲染编码器已声明过的，重复的跳过（计算编码器每次派发新建，不去重）
 // useResource is idempotent for the same (resource, usage, stage) within one encoder: remember what this render encoder has already declared and skip repeats (a compute encoder is created anew for each dispatch, no dedup)
 static uint8_t g_args_dirty[6] = {1, 1, 1, 1, 1, 1};
-static uint64_t g_args_reg_seen, g_args_dirty_seen;
+static uint64_t g_args_reg_seen, g_args_dirty_seen, g_args_serial_seen, g_args_snapshot_seen;
 static uint64_t g_args_epoch[6] = {1, 1, 1, 1, 1, 1};
 static inline void args_dirty_stage(int stage) {
     g_args_dirty[stage] = 1;
@@ -8147,9 +8278,14 @@ static inline void args_program_changed(void) {
     memset(g_args_dirty, 1, sizeof g_args_dirty);
 }
 static inline void args_sync_dirty(void) {
-    uint64_t reg = g_reg_gen, dirty = nvn_dirty_now();
-    if (reg != g_args_reg_seen || dirty != g_args_dirty_seen) {
-        g_args_reg_seen = reg; g_args_dirty_seen = dirty; args_dirty_all();
+    uint64_t reg = g_reg_gen, dirty = nvn_dirty_now(), serial = g_ser_gen, snapshot = g_usnap_drops;
+    // Replaced textures and retired uniform snapshots change argument addresses without a new binding.
+    // 纹理替换和统一缓冲快照退休会改变参数地址，即使绑定本身未变。
+    if (reg != g_args_reg_seen || dirty != g_args_dirty_seen ||
+        serial != g_args_serial_seen || snapshot != g_args_snapshot_seen) {
+        g_args_reg_seen = reg; g_args_dirty_seen = dirty;
+        g_args_serial_seen = serial; g_args_snapshot_seen = snapshot;
+        args_dirty_all();
     }
 }
 static void bind_args(id<MTLCommandEncoder> en, int nvn_stage, int metal_vertex, id<MTLBuffer> ab, uint64_t gpu, size_t off, NSUInteger ai) {
@@ -13024,6 +13160,25 @@ int dm_gfx_fps_now(int *generated) {
     if (generated) *generated = gen > 0 ? gen : 0;
     return fps_overlay_value();
 }
+/* iPhone held sideways (2026-10-25, user: the FPS box was cut off): the notch and the rounded corners cover the screen's
+   sides, so the corner boxes keep out of its safe area, which the front end reports in drawable pixels (frontend_ios.m
+   runtime_ios_sync_drawable). Only the part of the inset the picture reaches counts: a 16:9 picture between bars needs
+   none. Nothing reports it on the Mac, where the boxes stay at the corners. */
+static _Atomic int g_hud_safe_w, g_hud_safe_h, g_hud_safe_side, g_hud_safe_bottom;
+void mtl_hud_safe_area(int w, int h, int side, int bottom) {
+    int was_side = atomic_exchange(&g_hud_safe_side, side), was_bottom = atomic_exchange(&g_hud_safe_bottom, bottom);
+    int changed = was_side != side || was_bottom != bottom;
+    atomic_store(&g_hud_safe_w, w); atomic_store(&g_hud_safe_h, h);
+    if (changed) MLOG("[hud] 安全区：两侧 %d 像素、底部 %d 像素（画布 %dx%d），角上的提示框避开它", side, bottom, w, h);
+}
+static double hud_inset_right(MTLViewport vp) {
+    int w = atomic_load(&g_hud_safe_w), s = atomic_load(&g_hud_safe_side); double gap = w - (vp.originX + vp.width);
+    return w > 0 && s > gap ? s - gap : 0;
+}
+static double hud_inset_bottom(MTLViewport vp) {
+    int h = atomic_load(&g_hud_safe_h), b = atomic_load(&g_hud_safe_bottom); double gap = h - (vp.originY + vp.height);
+    return h > 0 && b > gap ? b - gap : 0;
+}
 // TOTK: FPS, output resolution and (internal resolution) in the top-right corner of the game picture (pixels come from fps_overlay.c). Rasterises into
 // the slot's texture only when what is shown changes, and returns the viewport and source rectangle to draw.
 static int fps_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, float uv[8]) {
@@ -13048,7 +13203,7 @@ static int fps_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, float
     float bw = g_fps_box[slot][0], bh = g_fps_box[slot][1], W = FPS_OVERLAY_TEX_W, H = FPS_OVERLAY_TEX_H;
     pthread_mutex_unlock(&mu);
     double m = 3.0 * scale;
-    *ovp = (MTLViewport){vp.originX + vp.width - m - bw, vp.originY + m, bw, bh, 0, 1};   // top-right corner
+    *ovp = (MTLViewport){vp.originX + vp.width - m - bw - hud_inset_right(vp), vp.originY + m, bw, bh, 0, 1};   // top-right corner
     const float u[8] = {0, 0, bw / W, bh / H, 0.5f / W, 0.5f / H, (bw - 0.5f) / W, (bh - 0.5f) / H};
     memcpy(uv, u, sizeof u);
     return 1;
@@ -13090,7 +13245,7 @@ static int shader_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, fl
     double m = 3.0 * scale;
 #if TARGET_OS_IPHONE
     double below = fps_overlay_hints_enabled() && fps_overlay_enabled() ? g_fps_box[slot][1] + m : 0;   // under the FPS box (top-right)
-    *ovp = (MTLViewport){vp.originX + vp.width - m - bw, vp.originY + m + below, bw, bh, 0, 1};
+    *ovp = (MTLViewport){vp.originX + vp.width - m - bw - hud_inset_right(vp), vp.originY + m + below, bw, bh, 0, 1};
 #else
     *ovp = (MTLViewport){vp.originX + m, vp.originY + vp.height - m - bh, bw, bh, 0, 1};   // bottom-left corner
 #endif
@@ -13119,7 +13274,7 @@ static int load_overlay_prepare(int slot, MTLViewport vp, MTLViewport *ovp, floa
     float bw = g_load_box[slot][0], bh = g_load_box[slot][1], W = LOAD_OVERLAY_TEX_W, H = FPS_OVERLAY_TEX_H;
     pthread_mutex_unlock(&mu);
     double m = 3.0 * scale;
-    *ovp = (MTLViewport){vp.originX + vp.width - m - bw, vp.originY + vp.height - m - bh, bw, bh, 0, 1};   // bottom-right corner
+    *ovp = (MTLViewport){vp.originX + vp.width - m - bw - hud_inset_right(vp), vp.originY + vp.height - m - bh - hud_inset_bottom(vp), bw, bh, 0, 1};   // bottom-right corner
     const float u[8] = {0, 0, bw / W, bh / H, 0.5f / W, 0.5f / H, (bw - 0.5f) / W, (bh - 0.5f) / H};
     memcpy(uv, u, sizeof u);
     return 1;
@@ -15459,12 +15614,14 @@ int mtl_probe_vertex_streams(void) {
     g_vertex_streams_negative=0;atomic_store(&g_vertex_streams_on,saved);atomic_store(&g_arg_bind_cache_on,saved_arg);memset(&S.vbuf,0,sizeof S.vbuf);mtl_pool_del(mem);res_remove(texture);res_remove(rb);res_remove(arg_data);free(mem);return checked;
 }
 
+#include "nvn_args_invalidation_probe.h"
+
 /* Exercise production state_op + encode_args on real GPU draws. Distinct shader
    objects alternate with unchanged bindings, then UBO/storage/registry/serial
    changes invalidate them. Separate submissions/passes and snapshot retirement
    must also invalidate. Negative 18 ignores binding generations, 19 snapshots. */
 int mtl_probe_arg_epoch(void) {
-    mtl_init(); int checked = 0;
+    mtl_init(); int checked = probe_args_invalidation();
     const char *ne = getenv("TOTK_PROBE_NEGATIVE"); int negative = ne ? atoi(ne) : 0;
     const size_t size = 16384; void *mem = NULL;
     if (posix_memalign(&mem, size, size) || !mem) MDIE("argument epoch probe memory");
@@ -15617,11 +15774,16 @@ static void ashot_take(id<MTLTexture> src, const char *path, long frame) { @auto
         CGContextRef small = img ? CGBitmapContextCreate(NULL, ow, oh, 8, 0, cs, kCGImageAlphaNoneSkipLast) : NULL;
         CGImageRef out = NULL;
         if (small) { CGContextSetInterpolationQuality(small, kCGInterpolationMedium); CGContextDrawImage(small, CGRectMake(0, 0, ow, oh), img); out = CGBitmapContextCreateImage(small); }
-        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)p, (CFIndex)strlen(p), false);
+        static _Atomic unsigned ashot_seq;
+        unsigned seq = atomic_fetch_add_explicit(&ashot_seq, 1u, memory_order_relaxed);
+        char tmp[1056]; snprintf(tmp, sizeof tmp, "%s.%ld.%u.tmp", p, frame, seq);   /* pollers never see a half-written PNG at p */
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)tmp, (CFIndex)strlen(tmp), false);
         CGImageDestinationRef dst = url && out ? CGImageDestinationCreateWithURL(url, (__bridge CFStringRef)UTTypePNG.identifier, 1, NULL) : NULL;
         int ok = 0;
         if (dst) { CGImageDestinationAddImage(dst, out, NULL); ok = CGImageDestinationFinalize(dst); CFRelease(dst); }
         if (url) CFRelease(url);
+        if (ok && rename(tmp, p) != 0) ok = 0;
+        if (!ok) unlink(tmp);
         CGImageRelease(out); CGContextRelease(small); CGImageRelease(img); if (dp) CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
         MLOG("[ashot] F%ld t=%llu %s %s", frame, (unsigned long long)t, p, ok ? "ok" : "failed");
         free(p);
@@ -15917,10 +16079,12 @@ int botw_wb_from_stage(void *ev) {
     const uint8_t *src; @autoreleasepool { src = (const uint8_t *)((__bridge id<MTLBuffer>)e->stage).contents; }
     size_t off = 0;
     unsigned layers = t->L.layers ? t->L.layers : 1; int ok = 1;
+    if (!wb_target_lock(t)) return WB_POOL_GONE;
     for (unsigned l = 0; l < t->d.levels && ok; l++) for (unsigned y = 0; y < layers && ok; y++) {
         size_t lp; size_t n = wb_level_size(t, l, &lp, NULL, NULL);
         ok = !nvn_swizzle(&t->d, l, y, src + off, lp, t->mem); off += n; g_wb_bytes += n;
     }
+    pthread_mutex_unlock(&g_mu);
     if (++g_wb_from_stage == 1 || g_wb_from_stage % 5000 == 0) MLOG("[writeback] %llu written back from the submission's own copy (%llu copies staged)", (unsigned long long)g_wb_from_stage, (unsigned long long)g_wb_staged);
     return ok;
 }

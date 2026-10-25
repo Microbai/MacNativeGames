@@ -11,3 +11,7 @@ test:
 test-gpu:
 	@test -n "$(WORK)" || (echo 'Set WORK to a private directory outside the checkout'; exit 1)
 	$(PYTHON) scripts/test_gpu.py --work-dir "$(WORK)"
+.PHONY: test-ui
+test-ui:
+	@test -n "$(WORK)" || (echo 'Set WORK to a private directory outside the checkout'; exit 1)
+	$(PYTHON) scripts/test_settings.py --work-dir "$(WORK)"

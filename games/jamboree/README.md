@@ -62,6 +62,20 @@ Open the generated `.app`. Keyboard defaults:
 
 The macOS menu exposes face-button layout (`auto`, Nintendo labels, Xbox/PlayStation positions), A/B swap and full screen. `auto` recognizes Nintendo-style controller names; a manual choice is useful when a controller reports a generic name. These settings persist in `controller-layout.txt`. Keyboard inputs are unaffected by controller face-button remapping. Physical button presses, motion input and multi-controller play have **not** been verified for this contribution.
 
+Press **F1** or **⌘,** to open the dark in-game settings panel (also available in the app menu). A compact shortcut HUD appears in the upper-right corner:
+
+| Shortcut | Action |
+|---|---|
+| 1 | Show / hide shortcut hints |
+| 3 | Cycle the output cap: automatic, 720p, 1080p, 1440p, 2160p |
+| 6 | Cycle automatic / position / Nintendo-label controller mapping |
+| ⌃⌘F | Enter / leave full screen |
+| Escape (settings panel) | Close settings and return to the game |
+
+The panel applies output, fullscreen and button changes immediately and saves output/hint/controller preferences beside the save directory. The startup-fullscreen checkbox takes effect at the next launch. Existing three-key `controller-layout.txt` files remain compatible. Opening settings clears held keyboard input so it cannot stick after the window changes focus.
+
+**Output caps affect presentation only.** The drawable keeps the window's aspect ratio and never exceeds the window's native pixel dimensions. A 1080p cap on a 4K full-screen view yields 1920×1080 presentation; it does not change the game's internal render targets or provide true higher-resolution rendering. Original picture quality is the only implemented quality mode. MetalFX temporal anti-aliasing is visibly disabled and labeled as unsupported. Controller layout choices change face-button mapping, not the HID device into a single/dual Joy-Con.
+
 Private user state lives in:
 
 ```text
@@ -80,9 +94,10 @@ Rebuilding the app preserves that directory. Back up `save/` before testing a ne
 python3 -m unittest discover -s tests
 make -C games/jamboree test
 make -C games/jamboree test-gpu WORK=/path/to/private/Jamboree-gpu-tests
+make -C games/jamboree test-ui WORK=/path/to/private/Jamboree-ui-tests
 ```
 
-The first command is the repository's existing test suite. The game tests use synthetic inputs; the GPU tests need a Metal-capable Mac, but no game data or keys. Tests do not replace playing the game. See the [validation record](docs/validation.md) for the precise source build, observed scenes, shader failures and untested modes.
+The first command is the repository's existing test suite. The game tests use synthetic inputs; the GPU tests need a Metal-capable Mac, but no game data or keys. The UI target requires a macOS GUI session and exercises the actual AppKit controls and output sizing in Chinese and English without game data. Tests do not replace playing the game. See the [validation record](docs/validation.md) for the precise source build, observed scenes, shader failures and untested modes.
 
 ## Layout
 

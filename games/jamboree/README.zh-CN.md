@@ -35,6 +35,12 @@ python3 games/jamboree/scripts/build_jamboree.py \
 
 Mac 菜单可选择手柄布局、交换 A/B 和全屏，选择会保存。自动模式依据手柄名称识别 Nintendo 布局；通用名称的手柄可以手动选择。此次验证包含配置读取与保存，没有实际按压物理手柄、测试体感或多人同时输入。
 
+按 **F1** 或 **⌘,** 打开游戏内深色设置面板，也可以从应用菜单进入。右上角提供紧凑快捷键提示：**1** 显示/隐藏提示，**3** 循环切换输出上限，**6** 切换手柄按键布局，**⌃⌘F** 切换全屏。设置面板中按 Escape 返回游戏。
+
+面板提供自动/720p/1080p/1440p/2160p 输出上限、即时全屏、下次启动全屏、手柄布局、A/B 交换和快捷键提示。更改自动保存，旧的三项手柄配置继续兼容。
+
+**输出上限只控制显示尺寸，保持窗口比例，也不会超过窗口的实际像素尺寸；它不改变游戏内部渲染分辨率。** 原始画质是当前唯一实现的画质模式。MetalFX 时间性边缘平滑在面板中明确标记为尚未适配，并禁用勾选；手柄布局也不等于 Joy-Con 类型或体感适配。
+
 存档位于 `~/Library/Application Support/Super Mario Party Jamboree/save/`，同级包含临时文件、`controller-layout.txt` 和 `last-launch.log`。重新打包不覆盖存档。测试新运行时前建议备份存档；不要把这些文件加入提交。
 
 目前部分场景首次遇到着色器时会有约 9–17 秒停顿或短暂白屏，之后恢复渲染。完整着色器构建仍有 3 项既有 subgroup 翻译失败，具体范围见[验证记录](docs/validation.md)。局部场景约 60 FPS 不代表完整游戏稳定可玩。
@@ -45,6 +51,7 @@ Mac 菜单可选择手柄布局、交换 A/B 和全屏，选择会保存。自�
 python3 -m unittest discover -s tests
 make -C games/jamboree test
 make -C games/jamboree test-gpu WORK=/私人构建目录/Jamboree-gpu-tests
+make -C games/jamboree test-ui WORK=/私人构建目录/Jamboree-ui-tests
 ```
 
 目录内包含独立运行时、图形层、离线改写器、预编译着色器翻译工具、构建脚本、输入版本校验、回归测试和第三方许可。不会调用其他游戏目录。完整依赖说明、目录清单和构建记录见英文 README 与来源文档。

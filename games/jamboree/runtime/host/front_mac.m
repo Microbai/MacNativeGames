@@ -17,6 +17,8 @@
 #include "hle.h"
 #include "pad_slots.h"
 #include "haptics_apple.h"
+#import "front_settings.h"
+#include "mac_display_settings.h"
 #include <signal.h>
 #include <math.h>
 
@@ -115,9 +117,14 @@ static pad_slots g_slots;
 static GCController *g_held[DM_PLAYERS];   // the controller of each slot, kept alive while it holds it (the slot table keys on its pointer)
 static int g_merge, g_kbd_own;
 enum { DM_FACE_AUTO, DM_FACE_POSITION, DM_FACE_LABEL };
-static int g_face_layout = DM_FACE_AUTO, g_swap_ab, g_start_fullscreen;
+static _Atomic int g_face_layout = DM_FACE_AUTO, g_swap_ab;
+static int g_start_fullscreen, g_output_preset, g_show_hints = 1;
+static DmSettingsPanel *g_settings_panel;
+static DmShortcutHUD *g_shortcut_hud;
+static void settings_changed(DmMacSetting setting, NSInteger value);
+static void settings_refresh(void);
 static NSString *g_pad_settings_path;
-static NSMenuItem *g_face_items[3], *g_swap_item, *g_fullscreen_item;
+static NSMenuItem *g_face_items[3], *g_swap_item, *g_fullscreen_item, *g_hints_item, *g_output_items[5];
 
 static NSString *pad_settings_path(void) {
     const char *save = getenv("DM_SAVE");
@@ -128,8 +135,8 @@ static NSString *pad_settings_path(void) {
 static void pad_settings_save(void) {
     if (!g_pad_settings_path) return;
     static const char *layout[] = {"auto", "position", "label"};
-    NSString *text = [NSString stringWithFormat:@"layout=%s\nswap_ab=%d\nfullscreen=%d\n",
-                                                layout[g_face_layout], !!g_swap_ab, !!g_start_fullscreen];
+    NSString *text = [NSString stringWithFormat:@"layout=%s\nswap_ab=%d\nfullscreen=%d\noutput=%d\nhints=%d\n",
+                                                layout[g_face_layout], !!g_swap_ab, !!g_start_fullscreen, g_output_preset, !!g_show_hints];
     NSError *error = nil;
     if (![text writeToFile:g_pad_settings_path atomically:YES encoding:NSUTF8StringEncoding error:&error])
         LOG("front end: could not save controller settings to %s: %s", g_pad_settings_path.fileSystemRepresentation,
@@ -140,7 +147,7 @@ static void pad_settings_load(void) {
     g_pad_settings_path = pad_settings_path();
     g_face_layout = DM_FACE_AUTO;
     g_swap_ab = 0;
-    g_start_fullscreen = 0;
+    g_start_fullscreen = 0; g_output_preset = 0; g_show_hints = 1;
     const char *e;
     NSString *text = g_pad_settings_path ? [NSString stringWithContentsOfFile:g_pad_settings_path encoding:NSUTF8StringEncoding error:nil] : nil;
     for (NSString *raw in [text componentsSeparatedByString:@"\n"]) {
@@ -154,6 +161,8 @@ static void pad_settings_load(void) {
             else if ([value isEqualToString:@"label"]) g_face_layout = DM_FACE_LABEL;
         } else if ([key isEqualToString:@"swap_ab"]) g_swap_ab = value.intValue != 0;
         else if ([key isEqualToString:@"fullscreen"]) g_start_fullscreen = value.intValue != 0;
+        else if ([key isEqualToString:@"output"]) { NSInteger n = value.integerValue; if (n >= 0 && n < 5) g_output_preset = (int)n; }
+        else if ([key isEqualToString:@"hints"]) g_show_hints = value.intValue != 0;
     }
     e = getenv("DM_PAD_LAYOUT");
     if (e && !strcmp(e, "auto")) g_face_layout = DM_FACE_AUTO;
@@ -280,8 +289,10 @@ static void pads_start(void) {
 - (void)fitDrawable {
     CAMetalLayer *l = (CAMetalLayer *)self.layer; if (![l isKindOfClass:CAMetalLayer.class] || !self.window) return;
     l.contentsScale = self.window.backingScaleFactor;
-    NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1 || CGSizeEqualToSize(l.drawableSize, px)) return;
-    l.drawableSize = px; LOG("front end: drawable %.0fx%.0f", px.width, px.height);
+    NSSize px = [self convertSizeToBacking:self.bounds.size]; if (px.width < 1 || px.height < 1) return;
+    DmOutputSize size = dm_output_size((uint32_t)px.width, (uint32_t)px.height, g_output_preset);
+    NSSize output = NSMakeSize(size.width, size.height);
+    if (!CGSizeEqualToSize(l.drawableSize, output)) { l.drawableSize = output; LOG("front end: drawable %.0fx%.0f (output cap %d)", output.width, output.height, g_output_preset); }
 }
 - (void)setFrameSize:(NSSize)s { [super setFrameSize:s]; [self fitDrawable]; }
 - (void)viewDidChangeBackingProperties { [super viewDidChangeBackingProperties]; [self fitDrawable]; }
@@ -292,38 +303,19 @@ static void pads_start(void) {
 - (void)toggleSwapAB:(NSMenuItem *)item;
 - (void)resetController:(id)sender;
 - (void)toggleStartFullscreen:(NSMenuItem *)item;
+- (void)openSettings:(id)sender;
+- (void)chooseOutput:(NSMenuItem *)item;
+- (void)toggleHints:(id)sender;
 @end
 
 @implementation DmSettingsMenu
-- (void)chooseFaceLayout:(NSMenuItem *)item {
-    g_face_layout = (int)item.tag;
-    pad_settings_save();
-    pad_apply_settings();
-    static const char *layout[] = {"auto", "position", "label"};
-    LOG("front end: controller face buttons %s%s", layout[g_face_layout], g_swap_ab ? ", A/B swapped" : "");
-}
-- (void)toggleSwapAB:(NSMenuItem *)item {
-    (void)item;
-    g_swap_ab = !g_swap_ab;
-    pad_settings_save();
-    pad_apply_settings();
-    LOG("front end: controller A/B %s", g_swap_ab ? "swapped" : "normal");
-}
-- (void)resetController:(id)sender {
-    (void)sender;
-    g_face_layout = DM_FACE_AUTO;
-    g_swap_ab = 0;
-    pad_settings_save();
-    pad_apply_settings();
-    LOG("front end: controller settings reset to auto, A/B normal");
-}
-- (void)toggleStartFullscreen:(NSMenuItem *)item {
-    (void)item;
-    g_start_fullscreen = !g_start_fullscreen;
-    pad_settings_save();
-    pad_apply_settings();
-    LOG("front end: start in full screen %s", g_start_fullscreen ? "on" : "off");
-}
+- (void)chooseFaceLayout:(NSMenuItem *)item { settings_changed(DmSettingFaceLayout, item.tag); }
+- (void)toggleSwapAB:(NSMenuItem *)item { (void)item; settings_changed(DmSettingSwapAB, !g_swap_ab); }
+- (void)resetController:(id)sender { (void)sender; settings_changed(DmSettingResetController, 0); }
+- (void)toggleStartFullscreen:(NSMenuItem *)item { (void)item; settings_changed(DmSettingStartFullscreen, !g_start_fullscreen); }
+- (void)openSettings:(id)sender { (void)sender; [g_settings_panel showPanel]; }
+- (void)chooseOutput:(NSMenuItem *)item { settings_changed(DmSettingOutput, item.tag); }
+- (void)toggleHints:(id)sender { (void)sender; settings_changed(DmSettingHints, !g_show_hints); }
 @end
 
 static DmSettingsMenu *g_settings_menu_target;
@@ -346,8 +338,48 @@ static void install_controller_menu(NSMenu *bar) {
     NSMenu *view = [[NSMenu alloc] initWithTitle:@"显示"];
     g_fullscreen_item = [view addItemWithTitle:@"下次启动时全屏" action:@selector(toggleStartFullscreen:) keyEquivalent:@""];
     g_fullscreen_item.target = g_settings_menu_target;
+    NSMenu *outputs = [[NSMenu alloc] initWithTitle:dm_settings_text(@"输出尺寸上限", @"Output size cap")];
+    NSArray<NSString *> *names = @[dm_settings_text(@"自动（随窗口）", @"Automatic (window size)"), @"720p", @"1080p", @"1440p", @"2160p"];
+    for (int i = 0; i < 5; i++) {
+        NSMenuItem *item = [outputs addItemWithTitle:names[i] action:@selector(chooseOutput:) keyEquivalent:@""];
+        item.tag = i; item.target = g_settings_menu_target; g_output_items[i] = item;
+    }
+    [[view addItemWithTitle:outputs.title action:nil keyEquivalent:@""] setSubmenu:outputs];
+    g_hints_item = [view addItemWithTitle:dm_settings_text(@"快捷键提示", @"Shortcut hints") action:@selector(toggleHints:) keyEquivalent:@""];
+    g_hints_item.target = g_settings_menu_target;
     [[bar addItemWithTitle:@"显示" action:nil keyEquivalent:@""] setSubmenu:view];
     pad_apply_settings();
+}
+
+static DmMacSettings settings_snapshot(void) {
+    CGSize size = g_layer.drawableSize;
+    NSUInteger connected = 0; for (GCController *pad in GCController.controllers) if (pad.extendedGamepad) connected++;
+    return (DmMacSettings){.face_layout = g_face_layout, .swap_ab = g_swap_ab, .start_fullscreen = g_start_fullscreen,
+        .output_preset = g_output_preset, .show_hints = g_show_hints, .fullscreen = (g_win.styleMask & NSWindowStyleMaskFullScreen) != 0,
+        .output_width = (NSUInteger)size.width, .output_height = (NSUInteger)size.height, .controllers = connected};
+}
+static void settings_refresh(void) {
+    pad_apply_settings();
+    for (int i = 0; i < 5; i++) g_output_items[i].state = g_output_preset == i;
+    g_hints_item.state = g_show_hints;
+    [g_settings_panel refresh]; [g_shortcut_hud refresh];
+}
+static void settings_changed(DmMacSetting setting, NSInteger value) {
+    switch (setting) {
+        case DmSettingFaceLayout: if (value >= 0 && value < 3) g_face_layout = (int)value; break;
+        case DmSettingSwapAB: g_swap_ab = value != 0; break;
+        case DmSettingStartFullscreen: g_start_fullscreen = value != 0; break;
+        case DmSettingOutput:
+            if (value >= 0 && value < 5) g_output_preset = (int)value;
+            [(DmGameView *)g_win.contentView fitDrawable]; break;
+        case DmSettingHints: g_show_hints = value != 0; break;
+        case DmSettingFullscreen:
+            if (((g_win.styleMask & NSWindowStyleMaskFullScreen) != 0) != (value != 0)) [g_win toggleFullScreen:nil];
+            break;
+        case DmSettingResetController: g_face_layout = DM_FACE_AUTO; g_swap_ab = 0; break;
+    }
+    pad_settings_save(); settings_refresh();
+    LOG("front end: settings layout=%d swap_ab=%d output=%d hints=%d start_fullscreen=%d", g_face_layout, g_swap_ab, g_output_preset, g_show_hints, g_start_fullscreen);
 }
 
 typedef struct { void (*fn)(void); } guest_arg;
@@ -370,6 +402,7 @@ void front_run(void (*guest)(void)) {
         NSWindow *win = [[NSWindow alloc] initWithContentRect:r
                                                     styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskResizable
                                                       backing:NSBackingStoreBuffered defer:NO];
+        win.contentMinSize = NSMakeSize(640, 360);
         win.title = @DM_GAME_NAME;   // the game profile's name (game name label)
         // Fullscreen: without FullScreenPrimary the green button only zooms the window. The present path already scales
         // the game picture to fit the drawable with black bars around it, so fullscreen keeps the game's aspect ratio.
@@ -387,12 +420,22 @@ void front_run(void (*guest)(void)) {
         g_screen_fps = (int)(win.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;
         g_win = win;
         [NSApp activateIgnoringOtherApps:YES];
-        pad_settings_load();
+        pad_settings_load(); [(DmGameView *)v fitDrawable];
+        g_settings_panel = [[DmSettingsPanel alloc] initWithParent:win snapshot:^{ return settings_snapshot(); }
+            change:^(DmMacSetting setting, NSInteger value) { settings_changed(setting, value); }];
+        g_shortcut_hud = [[DmShortcutHUD alloc] initWithSnapshot:^{ return settings_snapshot(); }
+            openSettings:^{ [g_settings_panel showPanel]; }];
+        g_shortcut_hud.autoresizingMask = NSViewMinXMargin | NSViewMinYMargin;
+        [v addSubview:g_shortcut_hud]; [g_shortcut_hud refresh];
         // Main menu: AppKit runs ⌘ shortcuts only through menu items, so ⌘Q quits and ⌃⌘F toggles fullscreen from here (AppKit shows the item as Globe-F and keeps ⌃⌘F as a hidden twin)
         NSMenu *bar = [NSMenu new], *app = [NSMenu new], *wm = [[NSMenu alloc] initWithTitle:@"Window"];
         [[bar addItemWithTitle:@"" action:nil keyEquivalent:@""] setSubmenu:app];
         [app addItemWithTitle:@"Quit " DM_GAME_NAME action:@selector(terminate:) keyEquivalent:@"q"];
         install_controller_menu(bar);
+        NSMenuItem *preferences = [app insertItemWithTitle:dm_settings_text(@"设置…", @"Settings…") action:@selector(openSettings:) keyEquivalent:@"," atIndex:0];
+        preferences.target = g_settings_menu_target;
+        [app insertItem:NSMenuItem.separatorItem atIndex:1];
+        settings_refresh();
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSApp.mainMenu = bar;
@@ -407,6 +450,16 @@ void front_run(void (*guest)(void)) {
         [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
+            if (!(e.modifierFlags & (NSEventModifierFlagCommand | NSEventModifierFlagControl | NSEventModifierFlagOption)) &&
+                (e.keyCode == 122 || e.keyCode == 18 || e.keyCode == 20 || e.keyCode == 22)) {
+                if (e.type == NSEventTypeKeyDown && !e.isARepeat) {
+                    if (e.keyCode == 122) [g_settings_panel showPanel];
+                    else if (e.keyCode == 18) settings_changed(DmSettingHints, !g_show_hints);
+                    else if (e.keyCode == 20) settings_changed(DmSettingOutput, (g_output_preset + 1) % 5);
+                    else settings_changed(DmSettingFaceLayout, (g_face_layout + 1) % 3);
+                }
+                return nil;
+            }
             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
             return nil;   // Swallow it to avoid the system beep
         }];
@@ -419,7 +472,7 @@ void front_run(void (*guest)(void)) {
         // content view by itself; only the scale factor has to be carried over to the screen the window ended up on. The screen's rate is matched in fullscreen only (screen_match_apply)
         [nc addObserverForName:NSWindowDidEnterFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
         [nc addObserverForName:NSWindowDidExitFullScreenNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_layer.contentsScale = win.backingScaleFactor; screen_match_apply(); }];
-        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; if (!win.miniaturized) dm_focus_set(2); }];
+        [nc addObserverForName:NSWindowDidResignKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; g_btn = 0; g_w = g_a = g_s = g_d = 0; push(); if (!win.miniaturized) dm_focus_set(2); }];
         [nc addObserverForName:NSWindowDidBecomeKeyNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(1); }];
         [nc addObserverForName:NSWindowDidMiniaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_focus_set(3); dm_audio_suspend(1); dm_gfx_suspend(1); }];
         [nc addObserverForName:NSWindowDidDeminiaturizeNotification object:win queue:nil usingBlock:^(NSNotification *n) { (void)n; dm_gfx_suspend(0); dm_audio_suspend(0); dm_focus_set(2); }];

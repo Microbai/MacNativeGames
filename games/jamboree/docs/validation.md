@@ -56,3 +56,15 @@ make -C games/jamboree test-gpu WORK=/path/to/private/Jamboree-gpu-tests
 ```
 
 For the private full build, use the command in [README.md](../README.md). Logs stay under `<work>/input/0100965017338000_build/logs/`. Preserve the generated app's `build-info.json` and the existing `patched_v458752/build_src.sha256` when reporting an issue. Share a redacted log and version identifiers; do not upload game programs, shader source/libraries, keys or saves.
+
+## macOS settings follow-up (2026-10-25)
+
+The Mac-only front end adds its own dark settings panel, a compact shortcut HUD and output-size caps. No shader chain, guest instruction patch or internal render resolution changed. The original shader failures and untested gameplay modes above remain applicable.
+
+- Root source suite: 331 passed; existing game/translator tests: 10 passed.
+- Native AppKit settings harness: 14 checks in each of Chinese and English (28 total), zero failures. Covers actual popup/checkbox actions, unavailable MetalFX state, reopening, screen bounds, automatic/native sizing, a 4K-to-1080p cap, non-16:9 aspect preservation, smaller windows and invalid/zero dimensions.
+- Rebuilt the arm64 2.3.0 host from this target and exercised it in an isolated app with a private save/config copy. Cmd-comma and F1 opened settings; the output selector changed the drawable from 2560×1440 to 1920×1080; A/B swap, hint toggle, output and layout hotkeys updated the real front-end state and persisted file.
+- Fullscreen worked with the settings panel open. A second launch restored the selected output cap, A/B swap, hidden hints and startup-fullscreen preference. The title scene continued submitting frames during the test; this does not add coverage for other game scenes or physical controllers.
+- The installed local app is updated only after backing up its executable/signature metadata; signature validation is repeated after the update. UI test screenshots and private runtime data are not committed.
+
+Run `make -C games/jamboree test-ui WORK=/path/to/private/Jamboree-ui-tests` in a macOS GUI session. The harness contains no game content, keys or game-derived shaders.

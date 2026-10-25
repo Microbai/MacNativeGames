@@ -4,7 +4,7 @@ Date: **2026-10-25**. Game: **Super Mario Party Jamboree 2.3.0**, `0100965017338
 
 Hardware: Apple M6 Mac mini (`Mac18,5`), Apple silicon / unified memory. OS: macOS **27.0.1 (26A434)**. This is the local test machine, not a performance promise for other Macs. Deployment target is macOS 26; macOS 26 itself has not been tested. iOS/iPadOS/visionOS were neither built nor played for this target.
 
-## Automated checks
+## Initial bring-up checks (2026-10-25)
 
 | Check | Result | What it establishes |
 |---|---|---|
@@ -14,7 +14,7 @@ Hardware: Apple M6 Mac mini (`Mac18,5`), Apple silicon / unified memory. OS: mac
 | Isolated native `t_vbuf` with Metal validation | 43 checks, 0 failed | Vertex buffer binding/invalidation behavior |
 | Isolated native `t_geometry` with Metal validation | 127 checks, 0 failed | Geometry, transform feedback, discard-only vertex stores and instancing |
 
-The GPU tests were rebuilt from **this game directory's copied source**, staged outside the checkout. No other game target supplied source, headers or compiler binaries. The translator chain computed by the staged source is `e6e2d522054e`; game shader inputs are `37da065929be`.
+The GPU tests were rebuilt from **this game directory's copied source**, staged outside the checkout. No other game target supplied source, headers or compiler binaries. That initial build used translator chain `e6e2d522054e` and shader inputs `37da065929be`. The review-cleanup build below supersedes those identifiers; these dated results are retained as historical evidence.
 
 ## Private build of this contribution
 
@@ -68,3 +68,33 @@ The Mac-only front end adds its own dark settings panel, a compact shortcut HUD 
 - The installed local app is updated only after backing up its executable/signature metadata; signature validation is repeated after the update. UI test screenshots and private runtime data are not committed.
 
 Run `make -C games/jamboree test-ui WORK=/path/to/private/Jamboree-ui-tests` in a macOS GUI session. The harness contains no game content, keys or game-derived shaders.
+
+## Maintainer review cleanup (2026-10-26)
+
+The translator is now **binary-only**, with 12 required files (10 binary payloads and two JSON metadata files). Its exact file set and full SHA-256 sums are checked before staging. Duplicate C# translator/Ryujinx source trees, all PDB files and Humanizer satellite resources are removed. Required licenses and pinned upstream source provenance remain. The native host still compiles libvpx from source for movie playback; no libvpx binary is distributed.
+
+The public shader map contains only generated package/index/stage/key. Both its writer and translator/diagnostic readers use this four-column format; the translator rejects an empty map or the old path-bearing format instead of silently building zero shaders. The profile uses generic grouping and an atomic extraction-root marker, with no original asset paths.
+
+- After integrating upstream main `33e8fa8`, root suite: **345 passed** (331 passed before integration).
+- Target suite: **12 packaging/input/tooling tests + 4 translator/map tests**, all passed. This includes reading all 25,693 public shader keys, rejecting old/empty maps, rejecting missing/modified local LibHac packages, rejecting unlisted translator files, and removing obsolete tooling from an existing workspace.
+- Metal regressions rebuilt after distribution cleanup: **43 vertex-buffer + 127 geometry/discard/feedback checks**, zero failures, Metal validation enabled. These use synthetic shaders; the subsequent map-reader fix changes Python build tooling only.
+- Distribution audit: all binary payloads are confined to the checksummed translator; no dependency package, PDB, satellite DLL, duplicate translator source, game content or original resource-path column remains. The PR diff against upstream changes only `games/jamboree/` and one root README line. Local documentation links and retained provenance destinations were checked.
+
+The LibHac 0.19.0 package is an explicit local prerequisite, pinned to SHA-256 `1431267861db5ff68216315b164f10c0edab4df162cedf5429bf8a143b76de19`; it is not committed or downloaded by the builder. Verification starts with an **empty** work-local NuGet cache and wraps the builder and all children in:
+
+```sh
+sandbox-exec -p '(version 1)(allow default)(deny network*)' \
+  python3 games/jamboree/scripts/build_jamboree.py /private/inputs \
+  --keys /private/prod.keys \
+  --libhac-package /local/dependencies/libhac.0.19.0.nupkg \
+  --work-dir /private/build \
+  --output '/private/Jamboree Offline.app' --language zh-Hans
+```
+
+The restore record has one package (`LibHac/0.19.0`) and one source (the work-local filesystem feed). NuGet's configuration clears inherited feeds/fallbacks; restore disables auditing and compile uses `--no-restore`. The generated app contains neither LibHac nor .NET build tools. A locally cached original extraction and fingerprint-matching rewritten modules are reused; this is a cold NuGet/offline validation, not a claim that every private intermediate was rebuilt from an empty work folder.
+
+The network-denied build completed successfully. The shader split was regenerated and all **25,693** four-column identifiers matched the public profile. The full shader pass reported **0 cache hits, 25,693 rebuilt, 25,690 successful translations**, plus the same three SPIRV-Cross subgroup-function failures; the known unknown-binding warning remains. It regenerated 5,237 shadow-input libraries, `c1_full.tsv` (5,313 shader keys) and `cb_extent.tsv` (24,814 shaders), rebuilt the arm64 native host, packaged the app and passed deep strict signature verification.
+
+Current chain: **`285c1c5ec4a2`**. Shader inputs: **`cac33153e188`**. Both generated runtime tables and the packaged library stamp agree. The signed host SHA-256 recorded in `build-info.json` was verified as `6ee3c808ed6d8cac189105280844686d2668733c506e6189c11afb38dc4e3d08`. As before, these outputs use runtime Metal compilation of translated MSL; this is not a claim that GPU pipelines are all compiled before play or that scene-transition pauses are fixed.
+
+The packaged host then completed a **60-second headless smoke run**, entered native `nnMain`, loaded the matching library stamp and 24,814 uniform-read extent records, and reached **frame 1,800** while remaining alive. It used an existing private test-save copy and separate temporary/config directories. Deep strict app-signature verification passed again after the run. This confirms packaged startup and rendering submission, not additional visual/gameplay or controller coverage; existing first-use Metal compilation stalls remain visible in timing logs.

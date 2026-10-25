@@ -15,7 +15,7 @@
 import os, sys, hashlib, subprocess
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
-FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_fetch.py', 'tools/dmsh_vin.py', 'tools/dmsh_geometry.py', 'tools/dmsh_facts.py', 'tools/dmsh_xlate/Program.cs', 'tools/dmsh_xlate/dmsh_xlate.csproj', '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
+FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_fetch.py', 'tools/dmsh_vin.py', 'tools/dmsh_geometry.py', 'tools/dmsh_facts.py', '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
 INPUT_TABLES = ['shader_facts.tsv', 'shader_map.tsv', 'shader_map.tsv.conflicts.tsv', 'shader_pairs.tsv', 'bf_want.tsv']   # in the game profile folder
 LOCK = os.path.join(HERE, 'dmsh_chain.lock'); HEADER = os.path.join(GFX, 'nvn/dmsh_chain.h')
 STAMP = 'inputs.tsv'   # in the library directory b-<V>/
@@ -74,13 +74,15 @@ def tools_now():
         t['metal_' + sdk] = t['metal_' + sdk][0]
     return t
 
-def xlate_source_sha():   # same convention as dmsh_xlate --source-sha: the embedded Program.cs and csproj concatenated in that order
-    return hashlib.sha256(b''.join(open(os.path.join(HERE, 'dmsh_xlate', f), 'rb').read() for f in ('Program.cs', 'dmsh_xlate.csproj'))).hexdigest()[:16]
+def xlate_source_sha():
+    """Expected embedded source hash of the binary-only pinned translator."""
+    return dict(l.rstrip('\n').split('\t', 1) for l in open(LOCK)
+                if '\t' in l and not l.startswith('#'))['xlate_source']
 
 def check_tools():
     want = dict(l.rstrip('\n').split('\t', 1) for l in open(LOCK) if '\t' in l and not l.startswith('#'))
     now = tools_now(); bad = [f'{k}: lock {want.get(k)} / actual {v}' for k, v in now.items() if want.get(k) != v]
-    if now['xlate_source'] != xlate_source_sha(): bad.append(f'the translator was not built from the in-repo source: embedded source {now["xlate_source"]} / in repo {xlate_source_sha()} (rebuild dmsh_xlate)')
+    if now['xlate_source'] != xlate_source_sha(): bad.append(f'translator embedded source differs from its lock: embedded {now["xlate_source"]} / pinned {xlate_source_sha()}')
     return bad
 
 def header_text(v):
@@ -92,7 +94,7 @@ if __name__ == '__main__':
     a = sys.argv[1:]
     if a == ['--update-lock']:
         t = tools_now()
-        if t['xlate_source'] != xlate_source_sha(): sys.exit(f'[RED] the translator was not built from the in-repo source (embedded {t["xlate_source"]} / in repo {xlate_source_sha()}): rebuild dmsh_xlate first')
+        if t['xlate_source'] != xlate_source_sha(): sys.exit(f'[RED] translator embedded source differs from its pin (embedded {t["xlate_source"]} / pinned {xlate_source_sha()})')
         open(LOCK, 'w').write('# Translation chain tool fingerprints (written by dmsh_chain.py --update-lock; regenerate after changing tools and commit it)\n' + ''.join(f'{k}\t{v}\n' for k, v in t.items()))
         print('wrote', LOCK)
     elif a == ['--check-tools']:

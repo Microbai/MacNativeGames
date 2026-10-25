@@ -13,6 +13,7 @@ import sys
 GAME = Path(__file__).resolve().parents[1]
 TITLE = '0100965017338000'
 APP_NAME = 'Super Mario Party Jamboree'
+LIBHAC_SHA256 = '1431267861db5ff68216315b164f10c0edab4df162cedf5429bf8a143b76de19'
 
 
 def copy_tree(source, destination):
@@ -29,16 +30,40 @@ def copy_tree(source, destination):
 
 def verify_prebuilt():
     root = GAME / 'prebuilt/macos-arm64'
+    expected = set()
     for line in (root / 'SHA256SUMS').read_text().splitlines():
         digest, rel = line.split('  ', 1)
+        expected.add(rel)
         if hashlib.sha256((root / rel).read_bytes()).hexdigest() != digest:
             raise ValueError(f'shader translator checksum mismatch: {rel}')
+    actual = {str(p.relative_to(root)) for p in (root / 'dmsh_xlate').rglob('*') if p.is_file()}
+    if actual != expected:
+        raise ValueError('shader translator file set differs from SHA256SUMS')
+
+
+def prepare_offline_dependencies(work, package):
+    """Accept an explicit local prerequisite; never download or use a global cache."""
+    package = package.expanduser().resolve()
+    if not package.is_file():
+        raise ValueError('local LibHac 0.19.0 package is missing; see README.md')
+    if hashlib.sha256(package.read_bytes()).hexdigest() != LIBHAC_SHA256:
+        raise ValueError('LibHac 0.19.0 package SHA-256 mismatch')
+    feed = work / 'dependencies/nuget'
+    feed.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(package, feed / 'libhac.0.19.0.nupkg')
+    return feed
 
 
 def stage(work):
     """Keep all generated code, tables and caches outside the checkout."""
     source = work / 'source'
     verify_prebuilt()
+    # Prune only obsolete managed tooling when upgrading an existing workspace.
+    # Otherwise copy_tree would retain removed translator sources/resources.
+    for rel in ('dm/third_party/ryujinx', 'dm/gfx/tools/dmsh_xlate', 'dm/gfx/tools/dmsh_xlate_bin'):
+        old = source / rel
+        if old.exists():
+            shutil.rmtree(old)
     copy_tree(GAME / 'runtime', source / 'dm')
     copy_tree(GAME / 'prebuilt/macos-arm64/dmsh_xlate', source / 'dm/gfx/tools/dmsh_xlate_bin')
     copy_tree(GAME / 'assets', source / 'assets')
@@ -147,6 +172,9 @@ def environment(work):
     env = dict(os.environ, DM_GAME=TITLE, DM_METAL_RUNTIME='1',
                TMPDIR=str(work / 'tmp'), NUGET_PACKAGES=str(work / 'cache/nuget'),
                DOTNET_CLI_HOME=str(work / 'cache/dotnet'), PYTHONDONTWRITEBYTECODE='1',
+               DM_NUGET_SOURCE=str(work / 'dependencies/nuget'),
+               DOTNET_CLI_TELEMETRY_OPTOUT='1', DOTNET_SKIP_FIRST_TIME_EXPERIENCE='1',
+               DOTNET_CLI_WORKLOAD_UPDATE_NOTIFY_DISABLE='true',
                MACOSX_DEPLOYMENT_TARGET='26.0')
     for key in ('TMPDIR', 'NUGET_PACKAGES', 'DOTNET_CLI_HOME'):
         Path(env[key]).mkdir(parents=True, exist_ok=True)
@@ -157,6 +185,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('inputs', type=Path, help='folder with base NSP/XCI and 2.3.0 update NSP')
     parser.add_argument('--keys', required=True, type=Path, help='your local prod.keys (never copied into the app)')
+    parser.add_argument('--libhac-package', required=True, type=Path,
+                        help='local LibHac 0.19.0 .nupkg (SHA-256 pinned; no download)')
     parser.add_argument('--work-dir', required=True, type=Path, help='private build directory outside the checkout')
     parser.add_argument('--output', required=True, type=Path, help='new .app output path')
     parser.add_argument('--language', default='en-US', choices=('en-US', 'en-GB', 'ja', 'fr', 'de', 'es-419', 'es', 'it', 'nl', 'fr-CA', 'ru', 'ko', 'zh-Hant', 'zh-Hans', 'pt-BR'), help='game language, e.g. en-US or zh-Hans')
@@ -170,6 +200,7 @@ def main():
     if not args.inputs.expanduser().is_dir() or not args.keys.expanduser().is_file():
         parser.error('inputs folder and keys must exist')
     work.mkdir(parents=True, exist_ok=True)
+    prepare_offline_dependencies(work, args.libhac_package)
     source = stage(work)
     inputs = link_inputs(args.inputs.expanduser().resolve(), work)
     env = environment(work)

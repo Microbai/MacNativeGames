@@ -10,7 +10,7 @@
 
 ## 构建方法
 
-需要支持 Metal 4 的苹果芯片 Mac、macOS 26+、Xcode/macOS 26+ SDK、Python 3.11+、.NET SDK 10、`make`、`clang`、`zstd`、`spirv-cross`。Python 依赖为 `lz4 capstone fonttools`，3.14 以前另需 `backports.zstd`。首次恢复 .NET 提取工具依赖需要联网。当前只提供 Mac 构建入口，iOS 未编译、未测试。
+需要支持 Metal 4 的苹果芯片 Mac、macOS 26+、Xcode/macOS 26+ SDK、Python 3.11+、.NET SDK 10、`make`、`clang`、`zstd`、`spirv-cross`。Python 依赖为 `lz4 capstone fonttools`，3.14 以前另需 `backports.zstd`。所有依赖预先安装后，构建过程不联网。另需通过 `--libhac-package` 显式提供本地 `libhac.0.19.0.nupkg`；不自动下载，不把该依赖包放入仓库。当前只提供 Mac 构建入口，iOS 未编译、未测试。
 
 自行提供未经修改的本体 NSP/XCI、**2.3.0 更新 NSP** 和 `prod.keys`。本体和更新放在同一文件夹；无可识别票据时，文件名应含 `[标题ID]`，更新文件另含 `[v458752]`。提取后还会核对三个 NSO 的完整 SHA-256、大小和 build ID，文件名不能绕过校验。其他版本、DLC 和压缩容器不在支持范围内。
 
@@ -20,10 +20,15 @@
 python3 games/jamboree/scripts/build_jamboree.py \
   /你的游戏输入文件夹 \
   --keys /你的密钥位置/prod.keys \
+  --libhac-package /你的本地依赖/libhac.0.19.0.nupkg \
   --work-dir /私人构建目录/Jamboree-build \
   --output '/私人产出目录/Super Mario Party Jamboree.app' \
   --language zh-Hans
 ```
+
+LibHac 包的 SHA-256 必须为 `1431267861db5ff68216315b164f10c0edab4df162cedf5429bf8a143b76de19`，可使用已有本地依赖包或缓存中的该文件。构建器先校验，再复制到工作目录的本地 NuGet 源；恢复依赖时清空继承的网络源、关闭在线审计，编译阶段使用 `--no-restore`。空 NuGet 缓存可以构建；包缺失或不匹配会报错，不会联网补齐。使用 Makefile 时设置 `LIBHAC=/本地/libhac.0.19.0.nupkg`。
+
+翻译器只保留带 SHA-256 的必需二进制，移除重复源码、`.pdb` 与 Humanizer 语言资源；来源和许可证另行保留。libvpx 是宿主播放影片所需的源码依赖，仍保留并从源码编译。着色器表只记录生成包编号、阶段和键，不记录原始资源路径；重建也不会重新写回这些路径。
 
 构建与产出目录放在 Git 仓库外，至少预留 **25 GB** 可用空间。构建器把所需源码与工具复制到工作目录，从原始游戏输入生成结果；重复构建按指纹复用阶段。输出 App 已存在时会拒绝覆盖，请选择新路径或自行移走旧版本。不要手改改写后的二进制。
 

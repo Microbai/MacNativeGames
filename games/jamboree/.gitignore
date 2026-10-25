@@ -24,3 +24,7 @@ runtime/games/*/cb_extent.tsv
 runtime/gfx/tests/t_*[!.cmh]
 runtime/tools/nx_extract/obj/
 runtime/tools/nx_extract/bin/
+
+# Local offline dependencies and translator debug artifacts are not contribution inputs.
+*.nupkg
+*.pdb

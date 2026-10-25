@@ -11,14 +11,14 @@ These notices live inside the isolated game directory to comply with the reposit
 | VP9 decoder subset | libvpx v1.17.0, commit `6df3ec3` | BSD 3-Clause; [license](runtime/third_party/libvpx/LICENSE), [patent grant](runtime/third_party/libvpx/PATENTS), [source record](runtime/third_party/libvpx/README.md) |
 | Vorbis decoder | stb_vorbis 1.22, commit `1ee679c` | MIT or public domain; [license](runtime/third_party/stb_vorbis/LICENSE) |
 | Vulkan header subset | Vulkan-Headers 1.4.363 | Apache-2.0 or MIT; [license](runtime/third_party/vulkan-headers/LICENSE.md); per-file SPDX notices retained |
-| Shader translation libraries only | Ryujinx 1.3.2 shader subset, with nxnative modifications | MIT; [license](runtime/third_party/ryujinx/LICENSE.txt), [modifications](runtime/third_party/ryujinx/README.md) |
-| SPIR-V generator | Spv.Generator, carried with the Ryujinx shader subset | MIT; [license](runtime/third_party/ryujinx/src/Spv.Generator/LICENSE) |
+| Shader translation libraries only | Ryujinx 1.3.2 shader subset, with nxnative modifications | MIT; [license](third_party/licenses/ryujinx.txt), [upstream binary modifications](third_party/licenses/ryujinx-build.md) |
+| SPIR-V generator | Spv.Generator, carried with the Ryujinx shader subset | MIT; [license](third_party/licenses/spv-generator.txt) |
 | Gommon | [GreemDev/Gommon](https://github.com/GreemDev/Gommon), NuGet 2.8.1.2, compiler dependency | MIT; [license](third_party/licenses/gommon.txt) |
-| Humanizer and localization assemblies | [Humanizr/Humanizer](https://github.com/Humanizr/Humanizer), NuGet 3.0.10, compiler dependency | MIT; [license](third_party/licenses/humanizer.txt) |
+| Humanizer (core assembly only) | [Humanizr/Humanizer](https://github.com/Humanizr/Humanizer), NuGet 3.0.10, compiler dependency | MIT; [license](third_party/licenses/humanizer.txt) |
 | Microsoft.IO.RecyclableMemoryStream | [Microsoft.IO.RecyclableMemoryStream](https://github.com/microsoft/Microsoft.IO.RecyclableMemoryStream), NuGet 3.0.1, compiler dependency | MIT; [license](third_party/licenses/recyclablememorystream.txt) |
 | MsgPack.Cli | [msgpack/msgpack-cli](https://github.com/msgpack/msgpack-cli), NuGet 1.0.1, compiler dependency | Apache-2.0, copyright 2010–2016 FUJIWARA, Yusuke; [license](third_party/licenses/msgpack-cli.txt) |
 | System.CodeDom | .NET, NuGet 4.4.0, compiler dependency | MIT; [license](third_party/licenses/system.codedom.txt) |
-| LibHac | NuGet 0.19.0, package source commit `cd4004af194a51712812c680f0a028ba9152c0f8`; restored at build time, not vendored | MIT, copyright 2018–2022 Alex Barney; [notice](third_party/licenses/libhac.txt); package metadata declares MIT |
+| LibHac | NuGet 0.19.0, package source commit `cd4004af194a51712812c680f0a028ba9152c0f8`; explicit SHA-256-pinned local package prerequisite; offline restore only, not vendored | MIT, copyright 2018–2022 Alex Barney; [notice](third_party/licenses/libhac.txt); package metadata declares MIT |
 
 The exact shader compiler dependency versions are recorded in `prebuilt/macos-arm64/dmsh_xlate/dmsh_xlate.deps.json`; binary checksums are in `prebuilt/macos-arm64/SHA256SUMS`. No emulator CPU backend, emulator service layer, game program, RomFS, original/translated game shader or game asset is distributed with this contribution.
 

@@ -18,7 +18,8 @@ shader_versions	v458752
 # ---- Files ----
 # every module main imports from
 modules	main subsdk0 sdk
-romfs_marker	movie/flow/op/movie/bq_op.mp4
+# Extraction is atomic; check its root without shipping an original asset path.
+romfs_marker	.
 zip_store	.bea:.bfstm:.mp4:.metallib
 
 # ---- Memory ----
@@ -32,7 +33,7 @@ app_pool	0xCD500000
 sys_resource	0x1000000
 
 # ---- Shader split ----
-shader_groups	/Archive/=archive /stream/=stream /nro/=nro /movie/=movie /.nrr/=nrr
+shader_groups	/=archive
 shader_note	Super Mario Party Jamboree shaders (provisional profile)
 
 # ---- Graphics ----

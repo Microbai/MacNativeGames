@@ -26,7 +26,7 @@ def tex_slots(key):
 nm = {}
 for ln in open(dmsh_chain.load_game().table('shader_map.tsv')):   # the current game profile's map (DM_GAME)
     c = ln.rstrip('\n').split('\t')
-    if len(c) > 4 and c[0].endswith('.bin'): nm.setdefault(c[3], c[0][:-4])
+    if len(c) == 4 and c[0].endswith('.bin'): nm.setdefault(c[3], c[0][:-4])
 for l in open(log, errors='replace'):
     m = re.search(r'\[pass\] F(\d+) (\w) (\d+) (.*)', l)
     if not m: continue

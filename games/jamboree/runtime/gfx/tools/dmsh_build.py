@@ -274,17 +274,27 @@ def vin_finish(key, full, refl):
     VIN_STATS['inputs'] += len(shadows); VIN_STATS['float only'] += sum(1 for s in shadows if 'sint' not in s and 'uint' not in s)
     return refl
 
-pc_of, loc = {}, {}
-MAP_ROWS, MAP_CONFLICT_ROWS = {}, {}
-for raw in open(MAP, 'rb'):
-    c = raw.rstrip(b'\n').split(b'\t')
-    if len(c) > 4: MAP_ROWS.setdefault(c[3].decode(), raw)
+def read_shader_map(path):
+    """Read the public four-column format; never depend on original asset paths."""
+    rows, locations = {}, {}
+    with open(path, 'rb') as stream:
+        for raw in stream:
+            if not raw.strip() or raw.startswith((b'#', b'package\t')): continue
+            c = raw.rstrip(b'\r\n').split(b'\t')
+            if len(c) != 4 or not c[0].endswith(b'.bin') or not re.fullmatch(rb'[0-9a-f]{16}', c[3]):
+                raise ValueError('shader map must contain package/index/stage/key only')
+            key = c[3].decode()
+            rows.setdefault(key, raw)
+            locations.setdefault(key, (c[0].decode(), int(c[1])))
+    if not locations: raise ValueError('shader map contains no shader keys')
+    return rows, locations
+
+MAP_ROWS, loc = read_shader_map(MAP)
+pc_of = dict.fromkeys(loc, '')   # This title has no paired PC shader sources.
+MAP_CONFLICT_ROWS = {}
 for raw in open(MAP + '.conflicts.tsv', 'rb'):
     c = raw.rstrip(b'\n').split(b'\t')
     if len(c) > 1 and not raw.startswith((b'#', b'dm_')): MAP_CONFLICT_ROWS.setdefault(c[0].decode(), raw)
-for ln in open(MAP):
-    c = ln.rstrip('\n').split('\t')
-    if len(c) > 4 and c[0].endswith('.bin'): pc_of.setdefault(c[3], c[4]); loc.setdefault(c[3], (c[0], int(c[1])))
 for ln in open(MAP + '.conflicts.tsv'):
     c = ln.rstrip('\n').split('\t')
     if len(c) > 1 and not ln.startswith('#') and not ln.startswith('dm_') and c[0] in pc_of: pc_of[c[0]] = c[1]
